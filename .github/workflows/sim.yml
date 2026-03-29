@@ -5,193 +5,144 @@ on:
   push:
     branches: [main]
 
-permissions:
-  packages: write
-
 jobs:
-  build-bases:
+  simulate:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        variant: [n, ns, nm, nsm, nsmpt]
     steps:
       - uses: actions/checkout@v6
 
-      - name: Build base image sim-${{ matrix.variant }}
+      - name: Run simulation
         run: |
-          echo "::group::Build sim-${{ matrix.variant }}"
-          START=$(date +%s%N)
-          docker build \
-            --build-arg PYPROJECT="pyproject-${{ matrix.variant }}.toml" \
-            -t "sim-${{ matrix.variant }}" \
-            -f base/Dockerfile.template \
-            base/
-          END=$(date +%s%N)
-          BUILD_MS=$(( (END - START) / 1000000 ))
-          echo "::endgroup::"
-          echo "BUILD_MS=$BUILD_MS" >> $GITHUB_ENV
-          echo "Base build time: ${BUILD_MS}ms"
+          VARIANTS="n ns nm nsm nsmpt"
+          RESULTS_FILE="results.txt"
 
-      - name: Measure base image size
-        run: |
-          SIZE=$(docker images "sim-${{ matrix.variant }}" \
-            --format "{{.Size}}" | head -1)
-          BYTES=$(docker inspect "sim-${{ matrix.variant }}" \
-            --format '{{.Size}}')
-          echo "SIZE=$SIZE" >> $GITHUB_ENV
-          echo "BYTES=$BYTES" >> $GITHUB_ENV
-          echo "Base image size: $SIZE ($BYTES bytes)"
+          echo "# Docker Base Image Simulation" | tee "$RESULTS_FILE"
+          echo "Runner: $(uname -m) $(nproc) cores" | tee -a "$RESULTS_FILE"
+          echo "Date: $(date -u)" | tee -a "$RESULTS_FILE"
+          echo "" | tee -a "$RESULTS_FILE"
 
-      - name: Measure base compressed size
-        run: |
-          docker save "sim-${{ matrix.variant }}" \
-            | gzip -1 \
-            | wc -c > /tmp/gz_size.txt
-          GZ=$(cat /tmp/gz_size.txt | tr -d ' ')
-          GZ_MB=$((GZ / 1048576))
-          echo "BASE_GZ=$GZ" >> $GITHUB_ENV
-          echo "BASE_GZ_MB=$GZ_MB" >> $GITHUB_ENV
-          echo "Base compressed: ${GZ_MB}MB"
-
-      - name: Measure base load time (import)
-        run: |
           # Import map
-          case "${{ matrix.variant }}" in
-            n)     IMP="import numpy" ;;
-            ns)    IMP="import numpy; import scipy" ;;
-            nm)    IMP="import numpy; import matplotlib" ;;
-            nsm)   IMP="import numpy; import scipy; import matplotlib" ;;
-            nsmpt) IMP="import numpy; import scipy; import matplotlib; import pandas; import tabulate" ;;
-          esac
+          import_for() {
+            case "$1" in
+              n)     echo "import numpy" ;;
+              ns)    echo "import numpy; import scipy" ;;
+              nm)    echo "import numpy; import matplotlib" ;;
+              nsm)   echo "import numpy; import scipy; import matplotlib" ;;
+              nsmpt) echo "import numpy; import scipy; import matplotlib; import pandas; import tabulate" ;;
+            esac
+          }
 
-          # Warm up
-          docker run --rm "sim-${{ matrix.variant }}" \
-            python3 -c "print('warm')" > /dev/null 2>&1
+          DS_IMPORT="import numpy; import scipy; import matplotlib; import pandas; import tabulate; import requests; import pytest"
 
-          TOTAL=0
-          for i in 1 2 3; do
+          # ---- Phase 1: Build base images ----
+          echo "## Phase 1: Base image builds" | tee -a "$RESULTS_FILE"
+          for v in $VARIANTS; do
+            echo "" | tee -a "$RESULTS_FILE"
+            echo "Building sim-$v ..." | tee -a "$RESULTS_FILE"
+
             START=$(date +%s%N)
-            docker run --rm "sim-${{ matrix.variant }}" \
-              python3 -c "$IMP" > /dev/null 2>&1
+            docker build \
+              --build-arg PYPROJECT="pyproject-${v}.toml" \
+              -t "sim-${v}" \
+              -f base/Dockerfile.template \
+              base/ 2>&1 | tail -3
             END=$(date +%s%N)
-            ELAPSED=$(( (END - START) / 1000000 ))
-            TOTAL=$((TOTAL + ELAPSED))
+            BUILD_S=$(( (END - START) / 1000000000 ))
+
+            SIZE=$(docker images "sim-${v}" --format "{{.Size}}" | head -1)
+            echo "  sim-$v: build=${BUILD_S}s  size=${SIZE}" | tee -a "$RESULTS_FILE"
           done
-          AVG=$((TOTAL / 3))
-          echo "BASE_LOAD_MS=$AVG" >> $GITHUB_ENV
-          echo "Base load time: ${AVG}ms (avg of 3)"
 
-      - name: Build downstream ds-${{ matrix.variant }}
-        run: |
-          echo "::group::Build ds-${{ matrix.variant }}"
-          START=$(date +%s%N)
-          docker build \
-            --build-arg "BASE=sim-${{ matrix.variant }}" \
-            -t "ds-${{ matrix.variant }}" \
-            downstream/
-          END=$(date +%s%N)
-          DS_BUILD_MS=$(( (END - START) / 1000000 ))
-          echo "::endgroup::"
-          echo "DS_BUILD_MS=$DS_BUILD_MS" >> $GITHUB_ENV
-          echo "Downstream build time: ${DS_BUILD_MS}ms"
+          # ---- Phase 2: Base load time ----
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "## Phase 2: Base container load time" | tee -a "$RESULTS_FILE"
+          for v in $VARIANTS; do
+            IMP=$(import_for "$v")
+            docker run --rm "sim-${v}" python3 -c "print('warm')" > /dev/null 2>&1
 
-      - name: Measure downstream size
-        run: |
-          DS_SIZE=$(docker images "ds-${{ matrix.variant }}" \
-            --format "{{.Size}}" | head -1)
-          DS_BYTES=$(docker inspect "ds-${{ matrix.variant }}" \
-            --format '{{.Size}}')
-          DELTA_BYTES=$((DS_BYTES - BYTES))
-          DELTA_MB=$((DELTA_BYTES / 1048576))
-          echo "DS_SIZE=$DS_SIZE" >> $GITHUB_ENV
-          echo "DS_BYTES=$DS_BYTES" >> $GITHUB_ENV
-          echo "DELTA_MB=$DELTA_MB" >> $GITHUB_ENV
-          echo "Downstream size: $DS_SIZE (delta: ${DELTA_MB}MB)"
+            TOTAL=0
+            for i in 1 2 3; do
+              START=$(date +%s%N)
+              docker run --rm "sim-${v}" python3 -c "$IMP" > /dev/null 2>&1
+              END=$(date +%s%N)
+              ELAPSED=$(( (END - START) / 1000000 ))
+              TOTAL=$((TOTAL + ELAPSED))
+            done
+            AVG=$((TOTAL / 3))
+            echo "  sim-$v: ${AVG}ms (avg of 3)" | tee -a "$RESULTS_FILE"
+          done
 
-      - name: Measure downstream compressed size
-        run: |
-          docker save "ds-${{ matrix.variant }}" \
-            | gzip -1 \
-            | wc -c > /tmp/ds_gz_size.txt
-          DS_GZ=$(cat /tmp/ds_gz_size.txt | tr -d ' ')
-          DS_GZ_MB=$((DS_GZ / 1048576))
-          GZ_DELTA=$((DS_GZ - BASE_GZ))
-          GZ_DELTA_MB=$((GZ_DELTA / 1048576))
-          echo "DS_GZ_MB=$DS_GZ_MB" >> $GITHUB_ENV
-          echo "GZ_DELTA_MB=$GZ_DELTA_MB" >> $GITHUB_ENV
-          echo "DS compressed: ${DS_GZ_MB}MB (delta: ${GZ_DELTA_MB}MB)"
+          # ---- Phase 3: Downstream builds ----
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "## Phase 3: Downstream builds" | tee -a "$RESULTS_FILE"
+          for v in $VARIANTS; do
+            echo "" | tee -a "$RESULTS_FILE"
+            echo "Building ds-$v on sim-$v ..." | tee -a "$RESULTS_FILE"
 
-      - name: Measure downstream load time
-        run: |
-          DS_IMP="import numpy; import scipy; import matplotlib; import pandas; import tabulate; import requests; import pytest"
-
-          docker run --rm "ds-${{ matrix.variant }}" \
-            python3 -c "print('warm')" > /dev/null 2>&1
-
-          TOTAL=0
-          for i in 1 2 3; do
             START=$(date +%s%N)
-            docker run --rm "ds-${{ matrix.variant }}" \
-              python3 -c "$DS_IMP" > /dev/null 2>&1
+            docker build \
+              --build-arg "BASE=sim-${v}" \
+              -t "ds-${v}" \
+              downstream/ 2>&1 | tail -3
             END=$(date +%s%N)
-            ELAPSED=$(( (END - START) / 1000000 ))
-            TOTAL=$((TOTAL + ELAPSED))
-          done
-          AVG=$((TOTAL / 3))
-          echo "DS_LOAD_MS=$AVG" >> $GITHUB_ENV
-          echo "Downstream load time: ${AVG}ms (avg of 3)"
+            BUILD_S=$(( (END - START) / 1000000000 ))
 
-      - name: Write results
-        run: |
-          cat <<EOF > results-${{ matrix.variant }}.txt
-          variant=${{ matrix.variant }}
-          base_build_ms=$BUILD_MS
-          base_size=$SIZE
-          base_gz_mb=$BASE_GZ_MB
-          base_load_ms=$BASE_LOAD_MS
-          ds_build_ms=$DS_BUILD_MS
-          ds_size=$DS_SIZE
-          ds_gz_mb=$DS_GZ_MB
-          gz_delta_mb=$GZ_DELTA_MB
-          delta_mb=$DELTA_MB
-          ds_load_ms=$DS_LOAD_MS
-          EOF
-          cat results-${{ matrix.variant }}.txt
+            DS_SIZE=$(docker images "ds-${v}" --format "{{.Size}}" | head -1)
+            echo "  ds-$v: build=${BUILD_S}s  size=${DS_SIZE}" | tee -a "$RESULTS_FILE"
+          done
+
+          # ---- Phase 4: Downstream load time ----
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "## Phase 4: Downstream container load time" | tee -a "$RESULTS_FILE"
+          for v in $VARIANTS; do
+            docker run --rm "ds-${v}" python3 -c "print('warm')" > /dev/null 2>&1
+
+            TOTAL=0
+            for i in 1 2 3; do
+              START=$(date +%s%N)
+              docker run --rm "ds-${v}" python3 -c "$DS_IMPORT" > /dev/null 2>&1
+              END=$(date +%s%N)
+              ELAPSED=$(( (END - START) / 1000000 ))
+              TOTAL=$((TOTAL + ELAPSED))
+            done
+            AVG=$((TOTAL / 3))
+            echo "  ds-$v: ${AVG}ms (avg of 3)" | tee -a "$RESULTS_FILE"
+          done
+
+          # ---- Phase 5: Compressed sizes ----
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "## Phase 5: Compressed sizes (GHCR transfer)" | tee -a "$RESULTS_FILE"
+          for v in $VARIANTS; do
+            BASE_GZ=$(docker save "sim-${v}" | gzip -1 | wc -c | tr -d ' ')
+            DS_GZ=$(docker save "ds-${v}" | gzip -1 | wc -c | tr -d ' ')
+            BASE_MB=$((BASE_GZ / 1048576))
+            DS_MB=$((DS_GZ / 1048576))
+            DELTA_MB=$(( (DS_GZ - BASE_GZ) / 1048576 ))
+            echo "  sim-$v: ${BASE_MB}MB  |  ds-$v: ${DS_MB}MB  |  delta: ${DELTA_MB}MB" \
+              | tee -a "$RESULTS_FILE"
+          done
+
+          # ---- Phase 6: Layer delta ----
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "## Phase 6: Layer delta (uncompressed)" | tee -a "$RESULTS_FILE"
+          for v in $VARIANTS; do
+            BASE_BYTES=$(docker inspect "sim-${v}" --format '{{.Size}}')
+            DS_BYTES=$(docker inspect "ds-${v}" --format '{{.Size}}')
+            DELTA=$(( (DS_BYTES - BASE_BYTES) / 1048576 ))
+            echo "  ds-$v: +${DELTA}MB over sim-$v" | tee -a "$RESULTS_FILE"
+          done
+
+          # ---- Summary table ----
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "## Summary" | tee -a "$RESULTS_FILE"
+          echo "" | tee -a "$RESULTS_FILE"
+          echo "GHCR context: base images pulled once and cached." | tee -a "$RESULTS_FILE"
+          echo "Per-commit cost = DS build time + gz delta push." | tee -a "$RESULTS_FILE"
 
       - name: Upload results
         uses: actions/upload-artifact@v6
+        if: always()
         with:
-          name: results-${{ matrix.variant }}
-          path: results-${{ matrix.variant }}.txt
-
-  summary:
-    runs-on: ubuntu-latest
-    needs: build-bases
-    steps:
-      - name: Download all results
-        uses: actions/download-artifact@v4
-        with:
-          pattern: results-*
-          merge-multiple: true
-
-      - name: Print summary table
-        run: |
-          echo "# Docker Base Image Simulation Results"
-          echo ""
-          printf "| %-8s | %12s | %8s | %10s | %12s | %8s | %10s | %10s | %10s |\n" \
-            "Variant" "Base Build" "Base gz" "Base Load" "DS Build" "DS gz" "gz Delta" "DS Delta" "DS Load"
-          printf "| %-8s | %12s | %8s | %10s | %12s | %8s | %10s | %10s | %10s |\n" \
-            "--------" "------------" "--------" "----------" "------------" "--------" "----------" "----------" "----------"
-
-          for f in results-*.txt; do
-            . "$f"
-            base_build_s=$((base_build_ms / 1000))
-            ds_build_s=$((ds_build_ms / 1000))
-            printf "| %-8s | %10ss | %5sMB | %7sms | %10ss | %5sMB | %7sMB | %7sMB | %7sms |\n" \
-              "$variant" "$base_build_s" "$base_gz_mb" "$base_load_ms" \
-              "$ds_build_s" "$ds_gz_mb" "$gz_delta_mb" "$delta_mb" "$ds_load_ms"
-          done
-
-          echo ""
-          echo "GHCR context: base images pulled once and cached."
-          echo "Per-commit cost = DS Build + gz Delta push."
+          name: simulation-results
+          path: results.txt
+          retention-days: 90
