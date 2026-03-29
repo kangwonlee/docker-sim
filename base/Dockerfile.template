@@ -1,0 +1,61 @@
+# Parameterized base image — build with:
+#   docker build --build-arg PYPROJECT=pyproject-n.toml -t sim-n -f Dockerfile.template .
+
+ARG PYPROJECT=pyproject-n.toml
+
+# Builder stage
+FROM python:3.13-slim AS builder
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    curl \
+    gfortran \
+    git \
+    libopenblas-dev \
+    libxsimd-dev \
+    pkg-config \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install uv
+ADD https://astral.sh/uv/install.sh /uv-installer.sh
+RUN sh /uv-installer.sh && rm /uv-installer.sh \
+    && cp /root/.local/bin/uv /usr/local/bin/uv
+
+WORKDIR /build
+
+ARG PYPROJECT
+COPY ${PYPROJECT} /build/pyproject.toml
+
+RUN uv pip install --no-cache-dir --system /build/ \
+    && find /usr/local/lib/python3.13/site-packages -name "*.pyc" -delete \
+    && find /usr/local/lib/python3.13/site-packages -name "*.egg-info" -exec rm -rf {} +
+
+# Final stage
+FROM python:3.13-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
+    libopenblas0 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Copy installed packages from builder
+COPY --from=builder /usr/local/lib/python3.13/site-packages /usr/local/lib/python3.13/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+# Bake in gemini-python-tutor
+RUN git clone --depth=1 --branch v0.3.13 \
+    https://github.com/kangwonlee/gemini-python-tutor /app/temp/ \
+    && mkdir -p /app/ai_tutor/ \
+    && mv /app/temp/*.py /app/ai_tutor \
+    && mv /app/temp/locale/ /app/ai_tutor/locale/ \
+    && uv pip install --no-cache-dir --system \
+       --requirement /app/temp/requirements.txt \
+    && rm -rf /app/temp
+
+RUN useradd -u 1001 -m runner \
+    && chown -R runner:runner /app/ai_tutor/
+
+USER runner
+WORKDIR /app

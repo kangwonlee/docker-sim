@@ -1,0 +1,9 @@
+[project]
+name = "sim-n"
+version = "0.0.1"
+dependencies = [
+    "numpy==2.3.5",
+    "pytest==8.3.5",
+    "pytest-json-report==1.5.0",
+    "pytest-xdist==3.6.1",
+]

@@ -1,0 +1,197 @@
+name: Docker Base Image Simulation
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  packages: write
+
+jobs:
+  build-bases:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        variant: [n, ns, nm, nsm, nsmpt]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build base image sim-${{ matrix.variant }}
+        run: |
+          echo "::group::Build sim-${{ matrix.variant }}"
+          START=$(date +%s%N)
+          docker build \
+            --build-arg PYPROJECT="pyproject-${{ matrix.variant }}.toml" \
+            -t "sim-${{ matrix.variant }}" \
+            -f base/Dockerfile.template \
+            base/
+          END=$(date +%s%N)
+          BUILD_MS=$(( (END - START) / 1000000 ))
+          echo "::endgroup::"
+          echo "BUILD_MS=$BUILD_MS" >> $GITHUB_ENV
+          echo "Base build time: ${BUILD_MS}ms"
+
+      - name: Measure base image size
+        run: |
+          SIZE=$(docker images "sim-${{ matrix.variant }}" \
+            --format "{{.Size}}" | head -1)
+          BYTES=$(docker inspect "sim-${{ matrix.variant }}" \
+            --format '{{.Size}}')
+          echo "SIZE=$SIZE" >> $GITHUB_ENV
+          echo "BYTES=$BYTES" >> $GITHUB_ENV
+          echo "Base image size: $SIZE ($BYTES bytes)"
+
+      - name: Measure base compressed size
+        run: |
+          docker save "sim-${{ matrix.variant }}" \
+            | gzip -1 \
+            | wc -c > /tmp/gz_size.txt
+          GZ=$(cat /tmp/gz_size.txt | tr -d ' ')
+          GZ_MB=$((GZ / 1048576))
+          echo "BASE_GZ=$GZ" >> $GITHUB_ENV
+          echo "BASE_GZ_MB=$GZ_MB" >> $GITHUB_ENV
+          echo "Base compressed: ${GZ_MB}MB"
+
+      - name: Measure base load time (import)
+        run: |
+          # Import map
+          case "${{ matrix.variant }}" in
+            n)     IMP="import numpy" ;;
+            ns)    IMP="import numpy; import scipy" ;;
+            nm)    IMP="import numpy; import matplotlib" ;;
+            nsm)   IMP="import numpy; import scipy; import matplotlib" ;;
+            nsmpt) IMP="import numpy; import scipy; import matplotlib; import pandas; import tabulate" ;;
+          esac
+
+          # Warm up
+          docker run --rm "sim-${{ matrix.variant }}" \
+            python3 -c "print('warm')" > /dev/null 2>&1
+
+          TOTAL=0
+          for i in 1 2 3; do
+            START=$(date +%s%N)
+            docker run --rm "sim-${{ matrix.variant }}" \
+              python3 -c "$IMP" > /dev/null 2>&1
+            END=$(date +%s%N)
+            ELAPSED=$(( (END - START) / 1000000 ))
+            TOTAL=$((TOTAL + ELAPSED))
+          done
+          AVG=$((TOTAL / 3))
+          echo "BASE_LOAD_MS=$AVG" >> $GITHUB_ENV
+          echo "Base load time: ${AVG}ms (avg of 3)"
+
+      - name: Build downstream ds-${{ matrix.variant }}
+        run: |
+          echo "::group::Build ds-${{ matrix.variant }}"
+          START=$(date +%s%N)
+          docker build \
+            --build-arg "BASE=sim-${{ matrix.variant }}" \
+            -t "ds-${{ matrix.variant }}" \
+            downstream/
+          END=$(date +%s%N)
+          DS_BUILD_MS=$(( (END - START) / 1000000 ))
+          echo "::endgroup::"
+          echo "DS_BUILD_MS=$DS_BUILD_MS" >> $GITHUB_ENV
+          echo "Downstream build time: ${DS_BUILD_MS}ms"
+
+      - name: Measure downstream size
+        run: |
+          DS_SIZE=$(docker images "ds-${{ matrix.variant }}" \
+            --format "{{.Size}}" | head -1)
+          DS_BYTES=$(docker inspect "ds-${{ matrix.variant }}" \
+            --format '{{.Size}}')
+          DELTA_BYTES=$((DS_BYTES - BYTES))
+          DELTA_MB=$((DELTA_BYTES / 1048576))
+          echo "DS_SIZE=$DS_SIZE" >> $GITHUB_ENV
+          echo "DS_BYTES=$DS_BYTES" >> $GITHUB_ENV
+          echo "DELTA_MB=$DELTA_MB" >> $GITHUB_ENV
+          echo "Downstream size: $DS_SIZE (delta: ${DELTA_MB}MB)"
+
+      - name: Measure downstream compressed size
+        run: |
+          docker save "ds-${{ matrix.variant }}" \
+            | gzip -1 \
+            | wc -c > /tmp/ds_gz_size.txt
+          DS_GZ=$(cat /tmp/ds_gz_size.txt | tr -d ' ')
+          DS_GZ_MB=$((DS_GZ / 1048576))
+          GZ_DELTA=$((DS_GZ - BASE_GZ))
+          GZ_DELTA_MB=$((GZ_DELTA / 1048576))
+          echo "DS_GZ_MB=$DS_GZ_MB" >> $GITHUB_ENV
+          echo "GZ_DELTA_MB=$GZ_DELTA_MB" >> $GITHUB_ENV
+          echo "DS compressed: ${DS_GZ_MB}MB (delta: ${GZ_DELTA_MB}MB)"
+
+      - name: Measure downstream load time
+        run: |
+          DS_IMP="import numpy; import scipy; import matplotlib; import pandas; import tabulate; import requests; import pytest"
+
+          docker run --rm "ds-${{ matrix.variant }}" \
+            python3 -c "print('warm')" > /dev/null 2>&1
+
+          TOTAL=0
+          for i in 1 2 3; do
+            START=$(date +%s%N)
+            docker run --rm "ds-${{ matrix.variant }}" \
+              python3 -c "$DS_IMP" > /dev/null 2>&1
+            END=$(date +%s%N)
+            ELAPSED=$(( (END - START) / 1000000 ))
+            TOTAL=$((TOTAL + ELAPSED))
+          done
+          AVG=$((TOTAL / 3))
+          echo "DS_LOAD_MS=$AVG" >> $GITHUB_ENV
+          echo "Downstream load time: ${AVG}ms (avg of 3)"
+
+      - name: Write results
+        run: |
+          cat <<EOF > results-${{ matrix.variant }}.txt
+          variant=${{ matrix.variant }}
+          base_build_ms=$BUILD_MS
+          base_size=$SIZE
+          base_gz_mb=$BASE_GZ_MB
+          base_load_ms=$BASE_LOAD_MS
+          ds_build_ms=$DS_BUILD_MS
+          ds_size=$DS_SIZE
+          ds_gz_mb=$DS_GZ_MB
+          gz_delta_mb=$GZ_DELTA_MB
+          delta_mb=$DELTA_MB
+          ds_load_ms=$DS_LOAD_MS
+          EOF
+          cat results-${{ matrix.variant }}.txt
+
+      - name: Upload results
+        uses: actions/upload-artifact@v6
+        with:
+          name: results-${{ matrix.variant }}
+          path: results-${{ matrix.variant }}.txt
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: build-bases
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: results-*
+          merge-multiple: true
+
+      - name: Print summary table
+        run: |
+          echo "# Docker Base Image Simulation Results"
+          echo ""
+          printf "| %-8s | %12s | %8s | %10s | %12s | %8s | %10s | %10s | %10s |\n" \
+            "Variant" "Base Build" "Base gz" "Base Load" "DS Build" "DS gz" "gz Delta" "DS Delta" "DS Load"
+          printf "| %-8s | %12s | %8s | %10s | %12s | %8s | %10s | %10s | %10s |\n" \
+            "--------" "------------" "--------" "----------" "------------" "--------" "----------" "----------" "----------"
+
+          for f in results-*.txt; do
+            . "$f"
+            base_build_s=$((base_build_ms / 1000))
+            ds_build_s=$((ds_build_ms / 1000))
+            printf "| %-8s | %10ss | %5sMB | %7sms | %10ss | %5sMB | %7sMB | %7sMB | %7sms |\n" \
+              "$variant" "$base_build_s" "$base_gz_mb" "$base_load_ms" \
+              "$ds_build_s" "$ds_gz_mb" "$gz_delta_mb" "$delta_mb" "$ds_load_ms"
+          done
+
+          echo ""
+          echo "GHCR context: base images pulled once and cached."
+          echo "Per-commit cost = DS Build + gz Delta push."
